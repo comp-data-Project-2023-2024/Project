@@ -339,8 +339,12 @@ class MetadataUploadHandler(UploadHandler):
                 file_path,
                 keep_default_na=False,
                 dtype={
-                    "Id": "string", "Type": "string", "Title": "string",
-                    "Date": "string", "Author": "string", "Owner": "string",
+                    "Id": "string", 
+                    "Type": "string", 
+                    "Title": "string",
+                    "Date": "string", 
+                    "Author": "string", 
+                    "Owner": "string",
                     "Place": "string",
                 },
             )
@@ -380,9 +384,6 @@ class MetadataUploadHandler(UploadHandler):
                 text_before_parentheses = row["Author"].split(" (")[0]
                 authorID_list = re.findall(r"\((.*?)\)", row["Author"])
                 authorID = authorID_list[0] if authorID_list else "noID"
-
-                if authorID != "noID":
-                    authorID = authorID.replace("VIAF:", "").replace("ULAN:", "")
                     
                 authorIRI = self.base_url + text_before_parentheses.replace(" ", "_").replace(",", "")
 
@@ -409,62 +410,78 @@ class QueryHandler(Handler):
         super().__init__()
 
     def getById(self, input_id: str) -> pd.DataFrame:
+
         if not self.db_path or not self.db_path.startswith(("http://", "https://")):
             return pd.DataFrame()
 
-        sparql_query = f"""
+        is_person_id = ":" in input_id
+
+        person_query = f"""
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             PREFIX schema: <https://schema.org/>
             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             PREFIX owl: <http://www.w3.org/2002/07/owl#>
 
-            SELECT DISTINCT ?CulturalObject ?label ?type_label ?date ?owner ?place ?authorEntity ?authorName ?authorId
+            SELECT DISTINCT ?authorEntity ?authorName ?authorId 
             WHERE {{
-                BIND(?resultEntity AS ?CulturalObject)
-                {{
-                    {{ ?subj schema:identifier "{input_id}" . }}
-                    UNION
-                    {{ ?subj owl:sameAs ?externalId . FILTER (CONTAINS(STR(?externalId), "{input_id}")) }}
-                    BIND(?subj AS ?resultEntity)
-                    OPTIONAL {{ ?resultEntity rdf:type ?type . }}
-                    OPTIONAL {{ ?resultEntity schema:name ?label . }}
-                    OPTIONAL {{ ?resultEntity rdfs:label ?label . }}
-                    OPTIONAL {{ ?resultEntity schema:dateCreated ?date . }}
-                    OPTIONAL {{ ?resultEntity schema:provider ?owner . }}
-                    OPTIONAL {{ ?resultEntity schema:contentLocation ?place . }}
-                    OPTIONAL {{
-                        ?resultEntity schema:creator ?authorEntity .
-                        ?authorEntity rdfs:label ?authorName .
-                        ?authorEntity schema:identifier ?authorId .
-                    }}
-                }}
+                {{ ?authorEntity schema:identifier "{input_id}" . }}
                 UNION
-                {{
-                    {{ ?authorEntity schema:identifier "{input_id}" . }}
-                    UNION
-                    {{ ?authorEntity owl:sameAs ?externalId . FILTER (CONTAINS(STR(?externalId), "{input_id}")) }}
-                    ?resultEntity schema:creator ?authorEntity .
-                    OPTIONAL {{ ?resultEntity rdf:type ?type . }}
-                    OPTIONAL {{ ?resultEntity schema:name ?label . }}
-                    OPTIONAL {{ ?resultEntity rdfs:label ?label . }}
-                    OPTIONAL {{ ?resultEntity schema:dateCreated ?date . }}
-                    OPTIONAL {{ ?resultEntity schema:provider ?owner . }}
-                    OPTIONAL {{ ?resultEntity schema:contentLocation ?place . }}
-                    OPTIONAL {{ ?authorEntity rdfs:label ?authorName . }}
-                    OPTIONAL {{ ?authorEntity schema:identifier ?authorId . }}
+                {{ ?authorEntity owl:sameAs ?externalId . FILTER (CONTAINS(STR(?externalId), "{input_id}")) }}
+                
+                OPTIONAL {{ ?authorEntity rdfs:label ?authorName . }}
+                OPTIONAL {{ ?authorEntity schema:identifier ?authorId . }}
+
+            }}
+        """
+
+        object_query = f"""
+            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+            PREFIX schema: <https://schema.org/>
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+            SELECT DISTINCT ?CulturalObject ?label ?type_label ?date ?owner ?place ?authorName ?authorId
+            WHERE {{
+                
+                # Find the Cultural Object using the input ID
+                {{ ?CulturalObject schema:identifier "{input_id}" . }}
+                UNION
+                {{ ?CulturalObject owl:sameAs ?externalId . FILTER (CONTAINS(STR(?externalId), "{input_id}")) }}
+                
+                OPTIONAL {{ ?CulturalObject rdf:type ?type . }}
+                OPTIONAL {{ ?CulturalObject schema:name ?label . }}
+                OPTIONAL {{ ?CulturalObject rdfs:label ?label . }}
+                OPTIONAL {{ ?CulturalObject schema:dateCreated ?date . }}
+                OPTIONAL {{ ?CulturalObject schema:provider ?owner . }}
+                OPTIONAL {{ ?CulturalObject schema:contentLocation ?place . }}
+                OPTIONAL {{
+                    ?CulturalObject schema:creator ?authorEntity .
+                    ?authorEntity rdfs:label ?authorName .
+                    ?authorEntity schema:identifier ?authorId .
                 }}
+
                 BIND(REPLACE(STR(COALESCE(?type, "")), "https://schema.org/", "") AS ?type_label)
             }}
         """
-  
-        results_df = self._execute_query(sparql_query)
-    
-        if "type_label" in results_df.columns:
-            filtered_df = results_df[results_df["type_label"] != "Author"].copy()
-            filtered_df = filtered_df.dropna(subset=['type_label'])
-        else:
-            filtered_df = results_df
-        return filtered_df
+        
+        sparql_query = person_query if is_person_id else object_query
+        response = requests.get(self.db_path, params={
+            'query': sparql_query,
+            'format': 'json'
+        })
+
+        if response.status_code != 200:
+            print(f"SPARQL query failed: {response.status_code}")
+            return pd.DataFrame()
+
+        data = response.json()
+
+        results = []
+        for binding in data.get("results", {}).get("bindings", []):
+            row = {var: binding[var]["value"] for var in binding}
+            results.append(row)
+
+        return pd.DataFrame(results)
             
 class MetadataQueryHandler(QueryHandler):
     def __init__(self, blazegraph_url: str = Handler.BLAZEGRAPH_URL):
@@ -931,86 +948,32 @@ class BasicMashup(object):
         return True
 
     def getEntityById(self, id_string: str) -> Optional['IdentifiableEntity']:
-        
-        metadata_row = None
-
-        for metadata_handler in self.metadataQuery:
-            entity_df = metadata_handler.getById(id_string) 
-            if not entity_df.empty:
-                metadata_row = entity_df.iloc[0]
+        for handler in self.metadataQuery:
+            df = handler.getById(id_string)
+            if df is not None and not df.empty:
                 break
-        
-        if metadata_row is None:
-            return None
-            
-        data = metadata_row.to_dict()
-
-        cultural_object_uri = data.pop('CulturalObject', None)
-        author_entity_uri = data.pop('authorEntity', None)
-
-        label = data.pop('label', None)
-        author_name = data.pop('authorName', None)
-        authorId = data.pop('authorId', None)
-
-        data.pop('resultEntity', None)
-        data.pop('type_label', None)
-        data.pop('identifier', None) 
-        date = data.pop('date', None)
-        owner = data.pop('owner', None)
-        place = data.pop('place', None)
-        
-
-        for key, value in list(data.items()):
-            if isinstance(value, float) and pd.isna(value):
-                data[key] = None
-            if key not in ['id', 'title', 'name', 'date', 'owner', 'place']:
-                data.pop(key, None)
-        
-        is_long_id = len(id_string) > 8 and id_string.isdigit()
-        entity_object = None
-        
-
-        if is_long_id:
-
-            final_id = authorId if authorId is not None else id_string
-            final_name = author_name if author_name is not None else label
-            
-            person_data = {'id': final_id, 'name': final_name}
-            entity_object = Person(**person_data)
-
-        elif len(id_string) <= 8 and id_string.isdigit(): 
-            final_id = cultural_object_uri if cultural_object_uri is not None else id_string
-
-            cho_data = {
-                'id': final_id, 
-                'title': label, 
-                'date': date, 
-                'owner': owner, 
-                'place': place,
-                'name': label,
-                'author_id': authorId, 
-                'author_name': author_name
-            }
-            entity_object = CulturalHeritageObject(**cho_data)
-            
         else:
-            entity_object = IdentifiableEntity(id=id_string) 
+            return None 
 
-        if entity_object is None:
-            entity_object = IdentifiableEntity(id=id_string)
-            
-        entity_id = entity_object.getId()
+        row = df.iloc[0]
 
-        all_activities_data = []
-        
-        for process_handler in self.processQuery:
-            activities_df = process_handler.getById(entity_id) 
-            if not activities_df.empty:
-                all_activities_data.extend(activities_df.to_dict('records'))
+        prefix = id_string.split(":")[0].upper() if ":" in id_string else None
+        if prefix in ["VIAF", "ULAN"]:
+            author_name = row.get("authorName") or row.get("label") or "Unknown"
+            return Person(id=id_string, name=author_name)
 
-        entity_object.activities = all_activities_data
-        
-        return entity_object
+        cultural_object_uri = row.get("CulturalObject") or id_string
+        cultural_object = CulturalHeritageObject(
+            id=cultural_object_uri,
+            title=row.get("label") or "Unknown",
+            date=row.get("date"),
+            owner=row.get("owner"),
+            place=row.get("place"),
+            author_id=row.get("authorId"),
+            author_name=row.get("authorName"),
+        )
+
+        return cultural_object
 
     def getAllPeople(self) -> List[Person]:
         all_people: List[Person] = []
@@ -1151,65 +1114,72 @@ class BasicMashup(object):
         return objects_list
 
     def getAllActivities(self) -> List['Activity']:
-
         all_activities = []
-        
+
         if not self.processQuery:
             return all_activities
 
+        activity_classes = {
+            "Acquisition": Acquisition,
+            "Processing": Processing,
+            "Modelling": Modelling,
+            "Optimising": Optimising,
+            "Exporting": Exporting,
+        }
+
         for handler in self.processQuery:
-            activities_df = handler.getAllActivities()
-            
-            if activities_df is not None and not activities_df.empty:
-                for _, row in activities_df.iterrows():
-                    activity_type = row.get("type")
-                    object_id = str(row.get("object_id"))
+            df = handler.getAllActivities()
+            if df is None or df.empty:
+                continue
 
-                    institute = row.get("responsible_institute", None)
-                    person = row.get("responsible_person", None)
-                    tool = row.get("tool", None)
-                    start = row.get("start_date", None)
-                    end = row.get("end_date", None)
-                    
-                    cultural_heritage_object = self.getEntityById(object_id)
-                        
-                    activity_params = {
-                        "refersTo": cultural_heritage_object,
-                        "institute": institute,
-                        "person": person,
-                        "tool": tool,
-                        "start": start,
-                        "end": end, }
-                        
-                    activity = None
-                    if activity_type == "Acquisition":
-                        technique = row.get("technique", None)
-                        activity = Acquisition(technique=technique, **activity_params)
-                    elif activity_type == "Processing":
-                        activity = Processing(**activity_params)
-                    elif activity_type == "Modelling":
-                        activity = Modelling(**activity_params)
-                    elif activity_type == "Optimising":
-                        activity = Optimising(**activity_params)
-                    elif activity_type == "Exporting":
-                        activity = Exporting(**activity_params)
-                    else:
-                        activity = Activity(**activity_params)
+            for _, row in df.iterrows():
+                activity_type = row.get("type")
+                object_id = str(row.get("object_id"))
 
-                    if activity:
-                        all_activities.append(activity)
+                institute = row.get("responsible_institute")
+                person = row.get("responsible_person")
+                tool = row.get("tool")
+                start = row.get("start_date")
+                end = row.get("end_date")
+
+                cultural_heritage_object = self.getEntityById(object_id)
+                
+                activity_params = {
+                    "refersTo": cultural_heritage_object,
+                    "institute": institute,
+                    "person": person,
+                    "tool": tool,
+                    "start": start,
+                    "end": end,
+                }
+
+                ObjClass = activity_classes.get(activity_type, Activity)
+                if ObjClass is Acquisition:
+                    technique = row.get("technique")
+                    activity = Acquisition(technique=technique, **activity_params)
+                else:
+                    activity = ObjClass(**activity_params)
+
+                all_activities.append(activity)
 
         return all_activities
 
     def getActivitiesByResponsibleInstitution(self, institute_name: str) -> List['Activity']:
         all_activities = []
-        
+
+        activity_classes = {
+            "Acquisition": Acquisition,
+            "Processing": Processing,
+            "Modelling": Modelling,
+            "Optimising": Optimising,
+            "Exporting": Exporting,
+        }
+
         for handler in self.processQuery:
             df = handler.getActivitiesByResponsibleInstitution(institute_name)
-            
+
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
-                    
                     activity_type = row.get("type")
                     object_id = str(row.get("object_id"))
 
@@ -1218,7 +1188,7 @@ class BasicMashup(object):
                     tool = row.get("tool", None)
                     start = row.get("start_date", None)
                     end = row.get("end_date", None)
-                        
+
                     cultural_heritage_object = self.getEntityById(object_id)
 
                     activity_params = {
@@ -1227,135 +1197,148 @@ class BasicMashup(object):
                         "person": person,
                         "tool": tool,
                         "start": start,
-                        "end": end, }
-                        
-                    activity = None
-                    if activity_type == "Acquisition":
-                        technique = row.get("technique", None)
-                        activity = Acquisition(technique=technique, **activity_params)
-                    elif activity_type == "Processing":
-                        activity = Processing(**activity_params)
-                    elif activity_type == "Modelling":
-                        activity = Modelling(**activity_params)
-                    elif activity_type == "Optimising":
-                        activity = Optimising(**activity_params) 
-                    elif activity_type == "Exporting":
-                        activity = Exporting(**activity_params)
-                        
-                    else:
-                        activity = Activity(**activity_params)
+                        "end": end,
+                    }
 
-                    if activity:
-                        all_activities.append(activity)
-                        
-        return all_activities
-
-    def getActivitiesByResponsiblePerson(self, person_name: str) -> List['Activity']:
-        all_activities = []
-
-        CHObject_types = getattr(self, 'CHObject_types', (CulturalHeritageObject,))
-
-        for handler in self.processQuery:
-            activities_df = handler.getActivitiesByResponsiblePerson(person_name)
-            
-            if activities_df is not None and not activities_df.empty:
-                for _, row in activities_df.iterrows():
-                    activity_type = row.get("type")
-                    object_id = str(row.get("object_id"))
-                        
-                    institute = row.get("responsible_institute", None)
-                    person = row.get("responsible_person", None)
-                    tool = row.get("tool", None)
-                    start = row.get("start_date", None)
-                    end = row.get("end_date", None)
-                        
-                    cultural_heritage_object = self.getEntityById(object_id)
-                    
-                    activity_params = {
-                        "refersTo": cultural_heritage_object,
-                        "institute": institute,
-                        "person": person,
-                        "tool": tool,
-                        "start": start,
-                        "end": end,}
-                        
-                    activity_classes = {
-                        "Acquisition": Acquisition,
-                        "Processing": Processing,
-                        "Modelling": Modelling,
-                        "Optimising": Optimising,
-                        "Exporting": Exporting,}
-                        
                     ObjClass = activity_classes.get(activity_type, Activity)
-                        
                     if ObjClass is Acquisition:
                         technique = row.get("technique", None)
                         activity = Acquisition(technique=technique, **activity_params)
                     else:
                         activity = ObjClass(**activity_params)
 
-                    if activity:
-                        all_activities.append(activity)
+                    all_activities.append(activity)
+
+        return all_activities
+
+    def getActivitiesByResponsiblePerson(self, person_name: str) -> List['Activity']:
+        all_activities = []
+
+        activity_classes = {
+            "Acquisition": Acquisition,
+            "Processing": Processing,
+            "Modelling": Modelling,
+            "Optimising": Optimising,
+            "Exporting": Exporting,
+        }
+
+        for handler in self.processQuery:
+            df = handler.getActivitiesByResponsiblePerson(person_name)
+
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    activity_type = row.get("type")
+                    object_id = str(row.get("object_id"))
+
+                    institute = row.get("responsible_institute", None)
+                    person = row.get("responsible_person", None)
+                    tool = row.get("tool", None)
+                    start = row.get("start_date", None)
+                    end = row.get("end_date", None)
+
+                    cultural_heritage_object = self.getEntityById(object_id)
+
+                    activity_params = {
+                        "refersTo": cultural_heritage_object,
+                        "institute": institute,
+                        "person": person,
+                        "tool": tool,
+                        "start": start,
+                        "end": end,
+                    }
+
+                    ObjClass = activity_classes.get(activity_type, Activity)
+                    if ObjClass is Acquisition:
+                        technique = row.get("technique", None)
+                        activity = Acquisition(technique=technique, **activity_params)
+                    else:
+                        activity = ObjClass(**activity_params)
+
+                    all_activities.append(activity)
 
         return all_activities
 
     def getActivitiesUsingTool(self, tool_name: str) -> List[Activity]: 
         all_activities = []
-        activities_df = pd.DataFrame()
 
-        if len(self.processQuery) > 0:
-            activities_df = self.processQuery[0].getAllActivities()
+        if len(self.processQuery) == 0:
+            return all_activities
 
-            for _, row in activities_df.iterrows():
-                tool = str(row["tool"])
+        activities_df = self.processQuery[0].getAllActivities()
 
-                if tool_name.lower() in tool.lower():
-                    activity_type = row["type"]
-                    object_id = str(row["object_id"])
-                    responsible_person = str(row["responsible_person"])
-                    responsible_institute = str(row["responsible_institute"])
-                    start_date = str(row["start_date"])
-                    end_date = str(row["end_date"])
+        for _, row in activities_df.iterrows():
+            tool_field = row.get("tool", None)
 
-                    cultural_heritage_object = CulturalHeritageObject( object_id, "", "", "", "")
+            if isinstance(tool_field, list):
+                tools = [t for t in tool_field if isinstance(t, str)]
+            elif isinstance(tool_field, str):
+                tools = [tool_field]
+            else:
+                tools = []
 
-                    activity = None
-                    if activity_type == "Acquisition":
-                        technique = str(row["technique"])
-                        activity = Acquisition(cultural_heritage_object, responsible_institute, technique,responsible_person, start_date, end_date, tool, )
-                    elif activity_type == "Processing":
-                        activity = Processing(cultural_heritage_object, responsible_institute, responsible_person, tool, start_date, end_date, )
-                    elif activity_type == "Modelling":
-                        activity = Modelling(cultural_heritage_object, responsible_institute, responsible_person, tool, start_date, end_date, )
-                    elif activity_type == "Optimising":
-                        activity = Optimising(cultural_heritage_object, responsible_institute, responsible_person, tool, start_date, end_date, )
-                    elif activity_type == "Exporting":
-                        activity = Exporting(cultural_heritage_object, responsible_institute, responsible_person, tool, start_date, end_date, )
+            matches = any(
+                tool_name.lower() in t.lower()
+                for t in tools
+            )
 
-                    if activity:
-                        all_activities.append(activity)
+            if not matches:
+                continue 
+
+            activity_type = row.get("type")
+            object_id = str(row.get("object_id"))
+            responsible_person = row.get("responsible_person", None)
+            responsible_institute = row.get("responsible_institute", None)
+            start_date = row.get("start_date", None)
+            end_date = row.get("end_date", None)
+            technique = row.get("technique", None)
+
+            cultural_heritage_object = self.getEntityById(object_id)
+
+            activity_params = {
+                "refersTo": cultural_heritage_object,
+                "institute": responsible_institute,
+                "person": responsible_person,
+                "tool": tools,
+                "start": start_date,
+                "end": end_date,
+            }
+
+            activity_classes = {
+                "Acquisition": Acquisition,
+                "Processing": Processing,
+                "Modelling": Modelling,
+                "Optimising": Optimising,
+                "Exporting": Exporting,
+            }
+
+            ObjClass = activity_classes.get(activity_type, Activity)
+            if ObjClass is Acquisition:
+                activity = Acquisition(technique=technique, **activity_params)
+            else:
+                activity = ObjClass(**activity_params)
+
+            all_activities.append(activity)
 
         return all_activities
 
     def getActivitiesStartedAfter(self, date: str) -> List['Activity']:
         all_activities = []
-        processed_ids = set() 
+        processed_ids = set()
 
         activity_classes = {
-            "Acquisition": Acquisition, 
-            "Processing": Processing, 
-            "Modelling": Modelling, 
-            "Optimising": Optimising, 
-            "Exporting": Exporting, }
+            "Acquisition": Acquisition,
+            "Processing": Processing,
+            "Modelling": Modelling,
+            "Optimising": Optimising,
+            "Exporting": Exporting,
+        }
 
         for handler in self.processQuery:
             activities_df = handler.getActivitiesStartedAfter(date)
-            
+
             if activities_df is not None and not activities_df.empty:
                 for _, row in activities_df.iterrows():
-                    activity_id = None 
-                    activity_id = row.get("id") 
-                        
+                    activity_id = row.get("id")
                     activity_type = row.get("type")
                     object_id = str(row.get("object_id"))
 
@@ -1365,16 +1348,18 @@ class BasicMashup(object):
                     start_date = row.get("start_date", None)
                     end_date = row.get("end_date", None)
 
+                    refers_to_obj = self.getEntityById(object_id)
+
                     activity_params = {
-                        "refersTo": object_id,
+                        "refersTo": refers_to_obj,
                         "institute": responsible_institute,
                         "person": responsible_person,
                         "tool": tool,
                         "start": start_date,
-                        "end": end_date,}
-                        
+                        "end": end_date,
+                    }
+
                     ObjClass = activity_classes.get(activity_type, Activity)
-                        
                     if ObjClass is Acquisition:
                         technique = row.get("technique", None)
                         activity = Acquisition(technique=technique, **activity_params)
@@ -1384,29 +1369,28 @@ class BasicMashup(object):
                     if activity:
                         all_activities.append(activity)
                         processed_ids.add(activity_id)
-  
+
         return all_activities
 
     
     def getActivitiesEndedBefore(self, date: str) -> List['Activity']:
         all_activities = []
-        processed_ids = set() 
+        processed_ids = set()
 
         activity_classes = {
-            "Acquisition": Acquisition, 
-            "Processing": Processing, 
-            "Modelling": Modelling, 
-            "Optimising": Optimising, 
-            "Exporting": Exporting, }
+            "Acquisition": Acquisition,
+            "Processing": Processing,
+            "Modelling": Modelling,
+            "Optimising": Optimising,
+            "Exporting": Exporting,
+        }
 
         for handler in self.processQuery:
             activities_df = handler.getActivitiesEndedBefore(date)
-            
+
             if activities_df is not None and not activities_df.empty:
                 for _, row in activities_df.iterrows():
-                    activity_id = None 
-                    activity_id = row.get("id") 
-                    
+                    activity_id = row.get("id")
                     activity_type = row.get("type")
                     object_id = str(row.get("object_id"))
 
@@ -1415,18 +1399,19 @@ class BasicMashup(object):
                     tool = row.get("tool", None)
                     start_date = row.get("start_date", None)
                     end_date = row.get("end_date", None)
-                        
+
+                    refers_to_obj = self.getEntityById(object_id)
 
                     activity_params = {
-                        "refersTo": object_id,
+                        "refersTo": refers_to_obj,
                         "institute": responsible_institute,
                         "person": responsible_person,
                         "tool": tool,
                         "start": start_date,
-                        "end": end_date, }
-                        
+                        "end": end_date,
+                    }
+
                     ObjClass = activity_classes.get(activity_type, Activity)
-                        
                     if ObjClass is Acquisition:
                         technique = row.get("technique", None)
                         activity = Acquisition(technique=technique, **activity_params)
@@ -1434,8 +1419,8 @@ class BasicMashup(object):
                         activity = ObjClass(**activity_params)
 
                     if activity:
-                            all_activities.append(activity)
-                            processed_ids.add(activity_id)
+                        all_activities.append(activity)
+                        processed_ids.add(activity_id)
 
         return all_activities
 
@@ -1459,12 +1444,21 @@ class BasicMashup(object):
                     activity_id = row.get("object_id")
                     
                     if activity_id and activity_id not in processed_ids:
-                        
+                        cultural_heritage_object = self.getEntityById(str(row.get("object_id")))
+                        if isinstance(cultural_heritage_object, Person) or cultural_heritage_object is None:
+                            cultural_heritage_object = CulturalHeritageObject(
+                                id=activity_id,
+                                title="",
+                                date=None,
+                                owner=None,
+                                place=None
+                            )
+
                         activity_type = row.get("type")
                         ObjClass = activity_classes.get(activity_type, Activity)
 
                         activity_params = {
-                            "refersTo": str(row.get("object_id")), 
+                            "refersTo": cultural_heritage_object,
                             "institute": row.get("responsible_institute"),
                             "person": row.get("responsible_person"),
                             "tool": row.get("tool"),
@@ -1472,7 +1466,6 @@ class BasicMashup(object):
                             "end": row.get("end_date"),
                         }
 
-                        activity = None
                         if ObjClass is Acquisition:
                             technique_val = row.get("technique", "Unknown")
                             activity = Acquisition(technique=technique_val, **activity_params)
@@ -1738,23 +1731,3 @@ class AdvancedMashup(BasicMashup):
 
 GRAPH_ENDPOINT = "http://127.0.0.1:9999/blazegraph/sparql"
 CSV_FILE = "data/meta.csv" 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
